@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior tests for update.sh; npm is a controlled subprocess fixture here.
+"""Behavior tests for update.sh and next.sh; npm is a controlled subprocess fixture here.
 
 Run: python3 tests/test_update.py
 Set DSH_UPDATE_SCRIPT to test an isolated copy (used for mutation checks).
@@ -16,6 +16,7 @@ import unittest
 
 
 SCRIPT = Path(os.environ.get("DSH_UPDATE_SCRIPT", Path(__file__).resolve().parent.parent / "update.sh")).resolve()
+NEXT_SCRIPT = Path(__file__).resolve().parent.parent / "next.sh"
 NODE = shutil.which("node")
 PYTHON = shutil.which("python3")
 
@@ -44,7 +45,8 @@ elif args[0] == "view":
     if os.environ.get("TEST_PROJECT_CONFIG") and "--global" not in args:
         print("project registry must not be used", file=sys.stderr)
         sys.exit(24)
-    version = os.environ.get("TEST_LATEST", "1.2.0")
+    tag = next(arg for arg in args if arg.startswith("@deepseek-ai/dsh@")).rsplit("@", 1)[1]
+    version = os.environ.get(f"TEST_{tag.upper()}", {"latest": "1.2.0", "next": "1.3.0-rc.1"}[tag])
     if os.environ.get("npm_config_json") == "true" and "--json=false" not in args:
         print(json.dumps(version))
     else:
@@ -103,9 +105,9 @@ class UpdateTests(unittest.TestCase):
         # Never fall through to the user's npm or dsh.
         self.env.update(PATH=f"{self.bin}:/usr/bin:/bin", TEST_ROOT=str(self.root))
 
-    def run_update(self, *args, **environment):
+    def run_update(self, *args, script=SCRIPT, **environment):
         return subprocess.run(
-            ["/bin/bash", str(SCRIPT), *args], env=self.env | environment,
+            ["/bin/bash", str(script), *args], env=self.env | environment,
             cwd=self.root, text=True, capture_output=True, timeout=20,
         )
 
@@ -236,11 +238,65 @@ class UpdateTests(unittest.TestCase):
         self.assert_failed(result, "was not found")
         self.assertEqual(self.calls("install"), [])
 
+    def test_channel_selects_npm_tag(self):
+        for channel, version in (("latest", "1.2.0"), ("next", "1.3.0-rc.1")):
+            with self.subTest(channel=channel):
+                result = self.run_update("--check", "--channel", channel)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"Checking npm {channel}...\nAvailable: {version}\n", result.stdout)
+                self.assertIn(f"@deepseek-ai/dsh@{channel}", self.calls("view")[-1])
+        self.assertEqual(self.calls("install"), [])
+
+    def test_next_installs_only_a_version_of_higher_semver_precedence(self):
+        # A release outranks its prereleases; numeric identifiers compare as
+        # numbers and below alphanumeric ones; more identifiers rank higher;
+        # build metadata does not count.
+        cases = (
+            ("1.2.0-rc.9", "1.2.0-rc.10", True), ("1.2.0-rc.10", "1.2.0-rc.9", False),
+            ("1.9.0", "1.10.0", True), ("1.10.0", "1.9.0", False),
+            ("1.2.0-rc.2", "1.2.0", True), ("1.2.0", "1.2.0-rc.3", False),
+            ("1.2.0-alpha.9", "1.2.0-alpha.beta", True), ("1.2.0-beta", "1.2.0-alpha.9", False),
+            ("1.2.0-alpha", "1.2.0-alpha.1", True), ("1.2.0-alpha.1", "1.2.0-alpha", False),
+            ("1.2.0+build.2", "1.2.0+build.1", False), ("1.2.0+build.2", "1.2.1+build.1", True),
+        )
+        for installed, tagged, newer in cases:
+            with self.subTest(installed=installed, tagged=tagged):
+                self.manifest.write_text(json.dumps({"version": installed}))
+                result = self.run_update("--channel", "next", TEST_NEXT=tagged)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.version(), tagged if newer else installed)
+                self.assertEqual("Done:" in result.stdout, newer, result.stdout)
+
+    def test_next_keeps_installation_only_after_verifying_cli(self):
+        for tagged, message in (("1.1.0", "Already on the next channel version."),
+                                ("1.1.0-rc.1", "not newer than the installed one")):
+            with self.subTest(tagged=tagged):
+                result = self.run_update("--channel", "next", TEST_NEXT=tagged)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(message, result.stdout)
+                failed = self.run_update("--channel", "next", TEST_NEXT=tagged, TEST_CLI_VERSION="0.0.1")
+                self.assert_failed(failed, "dsh --version returned")
+                self.assertNotIn(message, failed.stdout)
+        self.assertEqual(self.calls("install"), [])
+
+    def test_next_script_runs_next_channel_beside_update_script(self):
+        # As downloaded: both files in one directory, without the executable bit.
+        download = self.root / "download"
+        download.mkdir()
+        shutil.copyfile(SCRIPT, download / "update.sh")
+        shutil.copyfile(NEXT_SCRIPT, download / "next.sh")
+        result = self.run_update("--check", script=download / "next.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Available: 1.3.0-rc.1", result.stdout)
+        self.assertIn("@deepseek-ai/dsh@next", self.calls("view")[0])
+        self.assertEqual(self.calls("install"), [])
+
     def test_help_and_invalid_arguments_do_not_call_npm(self):
         result = self.run_update("--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("--check", result.stdout)
-        for args in (("--unknown",), ("--check", "extra")):
+        self.assertIn("--channel", result.stdout)
+        for args in (("--unknown",), ("--check", "extra"), ("--channel",), ("--channel", "beta")):
             with self.subTest(args=args):
                 result = self.run_update(*args)
                 self.assert_failed(result, "Error:")

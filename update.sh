@@ -4,9 +4,12 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Update DeepSeek Harness (@deepseek-ai/dsh) from the npm latest channel.
+Update DeepSeek Harness (@deepseek-ai/dsh) from an npm channel.
 
-Usage: ./update.sh [--check]
+Usage: ./update.sh [--channel latest|next] [--check]
+       ./next.sh [--check]   (the same as --channel next)
+  --channel  latest (default) installs its version even if it is older than
+             the installed one; next installs its version only if it is newer.
   --check    Show installed and available versions without installing.
   -h, --help Show help.
 
@@ -19,14 +22,50 @@ fail() {
   exit 1
 }
 
+# Succeed if version $1 has higher SemVer precedence than version $2.
+newer() {
+  node --input-type=commonjs - "$1" "$2" <<'NODE'
+const parse = (version) => {
+  const [release, ...rest] = version.split('+')[0].split('-');
+  return [release.split('.').map(BigInt), rest.length ? rest.join('-').split('.') : []];
+};
+const order = (a, b) => (a > b) - (a < b);
+const numeric = (identifier) => /^[0-9]+$/.test(identifier);
+const compare = ([releaseA, preA], [releaseB, preB]) => {
+  for (let i = 0; i < 3; i++) {
+    if (releaseA[i] !== releaseB[i]) return order(releaseA[i], releaseB[i]);
+  }
+  // A release outranks its prereleases.
+  if (!preA.length || !preB.length) return order(preB.length, preA.length);
+  for (let i = 0; i < Math.min(preA.length, preB.length); i++) {
+    const [a, b] = [preA[i], preB[i]];
+    // Numeric identifiers compare as numbers and rank below alphanumeric ones.
+    const result = numeric(a) && numeric(b) ? order(BigInt(a), BigInt(b))
+      : numeric(a) || numeric(b) ? order(numeric(b), numeric(a))
+      : order(a, b);
+    if (result) return result;
+  }
+  return order(preA.length, preB.length);
+};
+process.exit(compare(parse(process.argv[2]), parse(process.argv[3])) > 0 ? 0 : 1);
+NODE
+}
+
+channel=latest
 check_only=false
-case "${1:-}" in
-  --check) check_only=true ;;
-  -h|--help) usage; exit 0 ;;
-  '') ;;
-  *) usage >&2; fail "Unknown argument: $1" ;;
-esac
-[[ $# -le 1 ]] || fail 'Too many arguments.'
+while (($#)); do
+  case "$1" in
+    --channel)
+      [[ "${2:-}" =~ ^(latest|next)$ ]] || { usage >&2; fail '--channel takes latest or next.'; }
+      channel=$2
+      shift
+      ;;
+    --check) check_only=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; fail "Unknown argument: $1" ;;
+  esac
+  shift
+done
 
 command -v node >/dev/null 2>&1 || fail 'node was not found in PATH.'
 command -v npm >/dev/null 2>&1 || fail 'npm was not found in PATH.'
@@ -53,18 +92,26 @@ try {
 NODE
 
 installed=$(node --input-type=commonjs -e 'console.log(require(process.argv[1]).version)' "$manifest")
-printf 'Installed: %s\nChecking npm latest...\n' "$installed"
+printf 'Installed: %s\nChecking npm %s...\n' "$installed" "$channel"
 # Use the same npm configuration scope as the global installation, and keep
 # user/project JSON preferences from changing the version's representation.
-latest=$(npm view --global "$package@latest" version --json=false --fetch-retries=1 --fetch-timeout=15000)
-[[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
-  fail "npm returned an invalid version: $latest"
-printf 'Available: %s\n' "$latest"
+available=$(npm view --global "$package@$channel" version --json=false --fetch-retries=1 --fetch-timeout=15000)
+[[ "$available" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
+  fail "npm returned an invalid version: $available"
+printf 'Available: %s\n' "$available"
 
-if [[ "$installed" == "$latest" ]]; then
+# On next, a version without higher precedence is kept, so a next tag that
+# lags behind does not downgrade dsh.
+keep=
+if [[ "$installed" == "$available" ]]; then
+  keep="Already on the $channel channel version."
+elif [[ "$channel" == next ]] && ! newer "$available" "$installed"; then
+  keep='The next channel version is not newer than the installed one; nothing to install.'
+fi
+if [[ -n "$keep" ]]; then
   actual=$("$launcher" --version)
-  [[ "$actual" == "$latest" ]] || fail "dsh --version returned $actual instead of $latest."
-  printf 'Already on the latest channel version.\n'
+  [[ "$actual" == "$installed" ]] || fail "dsh --version returned $actual instead of $installed."
+  printf '%s\n' "$keep"
   exit 0
 fi
 
@@ -73,9 +120,9 @@ if "$check_only"; then
   exit 0
 fi
 
-printf 'Installing %s in %s...\n' "$latest" "$prefix"
+printf 'Installing %s in %s...\n' "$available" "$prefix"
 # Pin the version checked above; reject incompatible Node.js engines.
-npm install --global --prefix "$prefix" --engine-strict --force=false --no-fund --no-audit "$package@$latest"
+npm install --global --prefix "$prefix" --engine-strict --force=false --no-fund --no-audit "$package@$available"
 actual=$("$launcher" --version)
-[[ "$actual" == "$latest" ]] || fail "After installation, dsh --version returned $actual instead of $latest."
+[[ "$actual" == "$available" ]] || fail "After installation, dsh --version returned $actual instead of $available."
 printf 'Done: dsh %s. Restart running dsh sessions.\n' "$actual"
