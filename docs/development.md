@@ -66,61 +66,132 @@ The script does not launch profiles or contact a model. Normal npm lifecycle
 scripts can run during installation. It manages the npm CLI; the separate desktop
 application and its bundled runtime use the desktop application's updater.
 
-## Local checks
+## What earns a test its place
 
-From the repository root, with Node.js, Python 3.9+ and ShellCheck available:
+Each retained test must add a distinct observation, an independent reference, or
+an adversarial failure state that the other probes do not establish. The contract
+states the required behavior; it is not evidence that the behavior occurred.
+Test count and a green aggregate are not evidence of integration capability.
+Each test's docstring identifies its additional observation.
+
+Removed checks included mocked npm engine/configuration rules, ordinary success
+paths repeated by real npm probes, exact flag spelling and CLI message assertions,
+and a standalone check of standard subprocess output capture. The fault injector
+no longer pretends to implement npm's JSON, project-config, force, or engine rules.
+The old mocked no-write success was replaced by an actual npm dry-run experiment.
+
+A test should not be added merely to mirror a branch or sentence in the contract.
+Describe the competing failure explanation it distinguishes and its observable
+consequence. Missing tools, skipped probes, and failed integration attempts must
+be reported separately from successful observations.
+
+## Local probes
 
 ```sh
-bash -n update.sh
-bash -n next.sh
-shellcheck update.sh next.sh
 python3 tests/test_update.py
 python3 tests/test_npm.py
 python3 tests/test_process.py
 ```
 
-The behavior suite runs the real Bash scripts with a controlled npm subprocess
-in a temporary directory. It covers configuration, channel selection, installation
-selection including SemVer precedence on `next`, `--check`, repeated runs, failure
-before and after file changes, final version verification, retries, and `next.sh`
-beside a downloaded `update.sh`. Regression cases cover invalid installed versions,
-comparator process failure, read-only checks, overlapping updates, and lock release
-after termination. First-install cases cover a missing global root, `--check`,
-both channels, retries, conflicting launchers, missing `PATH` entries, invalid
-versions, npm failures, and simultaneous installers. This tests the scripts'
-logic, not npm's internals.
+### Controlled counterexamples: test_update.py
 
-`test_npm.py` runs real npm against a temporary local registry with tiny packages.
-It checks fresh installation, repeat runs, `next` precedence, engine rejection,
-missing bin links, and missing `PATH` entries. It needs no external registry and
-isolates npm configuration, cache, prefix, and tool paths.
+Bash, Node.js, subprocesses, signals, and files are real. npm is only a fault
+injector that supplies versions, writes files, pauses, or fails after a write.
+These cases establish the updater's response to the supplied state; they do not
+establish that real npm has a particular crash or rollback behavior.
 
-All test command runners use a shared process helper. It starts each command in
-its own session and, on a timeout or runner exception, kills its process group
-and collects output before temporary files are removed. This also stops children
-holding pipes open after their parent has exited. `test_process.py` checks these
-cases with real parent/child processes and verifies exit status and output capture.
-These forced test shutdowns may leave a lock inside the temporary prefix; the
-prefix is removed only after the command group has been stopped.
+| Probe | Additional observation |
+| --- | --- |
+| Comparison process failure | Exit 42 is not confused with a valid comparison saying the target is older; installation does not start. |
+| Failure after a durable write | A nonzero installer exit can coexist with a new on-disk version; retry uses that state without another installation. |
+| CLI failure after files changed | A child diagnostic written to stdout survives on stderr with its exit code, while the changed manifest remains visible. |
+| Foreign launcher | Two real launcher paths coexist, and the foreign executable and global manifest remain unchanged when they disagree. |
+| Concurrent first installations | The global root initially lacks a package manifest; a second process cannot pass the paused first installer. |
+| Concurrent next updates | An older installation is paused while a newer tag is offered; retry and a subsequent older tag cannot reverse the resulting version. |
+| SemVer reference vectors | Numeric/ASCII ordering, prerelease length, release precedence, and ignored build metadata are checked against externally derived data. |
+| SIGTERM during installation | Actual Bash trap delivery permits another update after a subprocess is terminated, without a stale lock blocking it. |
 
-## Real npm integration
+The SemVer oracle is [SemVer 2.0.0, clauses 10 and 11](https://semver.org/spec/v2.0.0.html),
+not a second copy of the production comparator. The mixed-identifier and build
+metadata cases distinguish specific wrong orderings; arbitrary extra versions do
+not add evidence. The finite vectors do not prove correctness for every input.
+
+### Real npm, local packages: test_npm.py
+
+A temporary HTTP registry serves tiny packages. Real npm handles configuration,
+cache, engine checks, files, and launcher creation. Its project registry override
+is deliberately unusable; only the isolated user registry can serve the packages.
+Required npm/Node tools being absent is an unavailable observation, reported as
+an INCONCLUSIVE setup error rather than a successful skipped run.
+
+| Probe | Additional observation |
+| --- | --- |
+| Configuration scope and launcher creation | Real npm uses the user registry despite the conflicting project config; preview leaves the prefix absent, and installation produces an independently executable CLI. |
+| Changed next tag | The registry receives a fresh metadata request after changing its tag; the installed newer version remains and the older tarball is not requested. |
+| Engine rejection | Real npm refuses an impossible Node requirement despite inherited force=true, without persisting the package. |
+| Disabled bin links | npm can persist a package with no launcher; a retry distinguishes incomplete installation from a missing PATH entry. |
+| Missing PATH entry | The absolute CLI actually runs after installation even though shell reachability verification fails. |
+| Dry-run success | A direct real npm invocation returns 0 without changing the installed version; the updater rejects that same condition. |
+
+These observations concern npm integration with those sample packages. They do
+not establish that the published dsh dependency graph or native modules install.
+
+### Process lifecycle: test_process.py
+
+These probes inspect actual Unix process state. One starts a live leader and a
+TERM-ignoring child. The other lets the leader exit while the child holds captured
+pipes open; checking only the leader's status would miss that case. Both verify
+that no process in the observed group remains able to write after the timeout.
+An unavailable process-state tool is reported as INCONCLUSIVE, not as success.
+
+The shared helper starts commands in separate sessions and kills their groups
+before collecting output and allowing temporary-file cleanup. This covers group
+members; descendants that deliberately create another session are not exercised.
+
+## Published-package integration: test_integration.py
 
 ```sh
 python3 tests/test_integration.py
 ```
 
-This opt-in test downloads and installs real dsh `0.1.5-alpha.2`, then updates it
-to the current `latest` in a temporary npm prefix. It requires internet access,
-a Node.js version compatible with both releases, and execution of normal npm
-lifecycle scripts. It isolates npm configuration, cache and `DSH_HOME`.
+This opt-in network probe adds the observation unavailable from the small local
+packages: published dsh and its real dependency graph can be installed and its
+CLI can execute in the measured environment. It prepares real 0.1.5-alpha.2,
+then exercises both an update and a first installation from latest using temporary
+prefixes and cache. It records Node/npm/platform and compares the independently
+queried registry version with the persisted manifest and direct CLI output.
+Normal npm lifecycle scripts execute; a temporary prefix is not a sandbox.
 
-It checks an unrelated project's registry override, inherited JSON/force settings,
-`--check`, the persisted version, actual CLI version output, and a repeated run.
-It also checks a first installation with `--install` in a fresh prefix, reusing
-the isolated cache and keeping the user's existing `dsh` out of that test's PATH.
-It also checks that the user's existing global CLI version is unchanged.
-Profile startup and model calls are outside this test's scope, and so is the
-`next` channel, which the behavior suite covers.
+Repeated --check, message-format, and idempotence assertions were removed from
+this probe because they did not add published-package evidence. If latest changes
+during a measured operation, the probe reports INCONCLUSIVE and exits 2. A failed
+installation or CLI invocation remains a failed integration observation; success
+of the local-package suite must not substitute for it. If the probe is not run,
+published-package integration remains unverified for that environment.
 
-The behavior and npm integration suites accept `DSH_UPDATE_SCRIPT` to test an
-isolated copy of the script.
+No retained probe establishes profile startup, model access, web UI behavior,
+desktop-app updates, or compatibility with other OS/Node/npm versions. Report
+what was observed and what remains unknown, without deriving those capabilities
+from a pass count.
+
+The script probes accept DSH_UPDATE_SCRIPT to exercise an isolated script copy.
+
+## Observed run: 2026-11-02
+
+On macOS 27.0.1 arm64, Node v24.22.1, npm 11.19.1, the controlled fault probes,
+local real-npm probes, and process-lifecycle probes completed their observations.
+This records that execution, not a claim about other machines or future releases.
+
+The published-package probe failed with npm exit 1 and EIDLETIMEOUT for
+registry.npmjs.org:443 while preparing baseline @deepseek-ai/dsh@0.1.5-alpha.2.
+The updater had not been invoked. Neither the published-package update nor its
+fresh latest installation was established by that run. The failure is retained
+as an integration limitation, not converted into a skipped or successful result.
+
+A repeat at 2026-11-02T04:14:13+00:00 completed with exit 0 in the same recorded environment.
+The baseline CLI reported 0.1.5-alpha.2. Both the update to 0.2.1-rc.5 and the first
+installation of 0.2.1-rc.5 in a fresh prefix completed; the independently queried
+registry version, installed manifest, and direct CLI output agreed in both cases.
+EIDLETIMEOUT did not recur. This confirms these installation/version-command
+observations for this run; profile startup, desktop/web behavior, model access,
+and other platforms remain unexercised.

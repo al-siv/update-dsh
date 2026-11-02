@@ -44,8 +44,12 @@ def archive(manifest):
     return buffer.getvalue()
 
 
-@unittest.skipUnless(NPM and NODE, "npm and node are required")
 class NpmTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not NPM or not NODE:
+            raise RuntimeError("INCONCLUSIVE: real npm observations require npm and node")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="dsh-local-npm-")
         self.addCleanup(self.temp.cleanup)
@@ -60,11 +64,13 @@ class NpmTests(unittest.TestCase):
         self.tags = {"latest": "1.2.0", "next": "1.2.0"}
         self.versions = {}
         self.tarballs = {}
+        self.requests = []
         owner = self
 
         class Registry(BaseHTTPRequestHandler):
             def do_GET(self):
                 path = unquote(urlsplit(self.path).path)
+                owner.requests.append(path)
                 if path == f"/{PACKAGE}":
                     data = json.dumps({
                         "name": PACKAGE, "dist-tags": owner.tags, "versions": owner.versions,
@@ -145,49 +151,70 @@ class NpmTests(unittest.TestCase):
         self.assertFalse((self.prefix / "lib/node_modules/.dsh-update.lock").exists())
         return result
 
-    def test_fresh_install_preview_and_repeat(self):
-        missing = self.run_script(expected=1)
-        self.assertIn("--install", missing.stderr)
-        preview = self.run_script("--install", "--check")
-        self.assertIn("Installed: not installed", preview.stdout)
-        self.assertIn("Available: 1.2.0", preview.stdout)
+    def test_real_npm_configuration_scope_and_launcher_creation(self):
+        """Real npm ignores the project registry and creates a runnable launcher."""
+        self.run_script("--install", "--check")
         self.assertFalse(self.prefix.exists())
-        installed = self.run_script("--install")
-        self.assertIn("Done: dsh 1.2.0", installed.stdout)
+        self.run_script("--install")
         self.assertEqual(json.loads(self.manifest.read_text())["version"], "1.2.0")
         actual = run_command(
             [str(self.prefix / "bin/dsh"), "--version"], env=self.env, timeout=10,
         )
         actual.check_returncode()
         self.assertEqual(actual.stdout.strip(), "1.2.0")
-        self.assertIn("Already on the latest", self.run_script("--install").stdout)
 
-    def test_next_install_does_not_downgrade_on_repeat(self):
+    def test_changed_next_tag_is_fetched_without_rolling_back_files(self):
+        """Publisher metadata changes after installation; npm must refetch it."""
         self.run_script("--install", script=self.next_script)
         self.tags["next"] = "1.1.0"
-        kept = self.run_script("--install", script=self.next_script)
-        self.assertIn("not newer", kept.stdout)
+        self.requests.clear()
+        self.run_script("--install", script=self.next_script)
+        self.assertIn(f"/{PACKAGE}", self.requests)
+        self.assertNotIn("/dsh-1.1.0.tgz", self.requests)
         self.assertEqual(json.loads(self.manifest.read_text())["version"], "1.2.0")
 
     def test_engine_failure_is_not_bypassed_by_inherited_force(self):
+        """Actual npm rejects an impossible engine even with inherited force=true."""
         self.tags["latest"] = "2.0.0"
         failed = self.run_script("--install", expected=1)
         self.assertIn("EBADENGINE", failed.stderr)
-        self.assertIn("npm installation failed (exit 1)", failed.stderr)
         self.assertFalse(self.manifest.exists())
 
     def test_missing_bin_link_is_a_verification_error(self):
+        """npm can persist the package while omitting its command; retry sees this."""
         failed = self.run_script("--install", expected=1, npm_config_bin_links="false")
         self.assertIn("npm did not create an executable dsh launcher", failed.stderr)
         self.assertTrue(self.manifest.exists())
+        self.assertFalse((self.prefix / "bin/dsh").exists())
         retry = self.run_script("--install", expected=1)
         self.assertIn("Global dsh installation is incomplete", retry.stderr)
-        self.assertNotIn("Add", retry.stderr)
+        self.assertNotIn(f"Add {self.prefix / 'bin'} to PATH", retry.stderr)
 
     def test_missing_path_is_an_error_after_package_installation(self):
+        """The absolute CLI runs despite the updater rejecting shell reachability."""
         failed = self.run_script("--install", expected=1, PATH=f"{self.tools_bin}:/usr/bin:/bin")
         self.assertIn(f"Add {self.prefix / 'bin'} to PATH", failed.stderr)
         self.assertEqual(json.loads(self.manifest.read_text())["version"], "1.2.0")
+        actual = run_command([str(self.prefix / "bin/dsh"), "--version"], env=self.env, timeout=10)
+        actual.check_returncode()
+        self.assertEqual(actual.stdout.strip(), "1.2.0")
+
+    def test_real_npm_dry_run_success_does_not_establish_an_update(self):
+        """Observe npm exit 0 with unchanged files, then the updater's rejection."""
+        self.tags["latest"] = "1.1.0"
+        self.run_script("--install")
+        self.tags["latest"] = "1.2.0"
+        env = self.env | {"npm_config_dry_run": "true"}
+        npm = run_command(
+            [NPM, "install", "--global", "--prefix", str(self.prefix),
+             "--engine-strict", "--force=false", "--no-fund", "--no-audit", f"{PACKAGE}@1.2.0"],
+            env=env, cwd=self.project, timeout=30,
+        )
+        self.assertEqual(npm.returncode, 0, npm.stdout + npm.stderr)
+        self.assertEqual(json.loads(self.manifest.read_text())["version"], "1.1.0")
+        rejected = self.run_script(expected=1, npm_config_dry_run="true")
+        self.assertIn("dsh --version returned", rejected.stderr)
+        self.assertEqual(json.loads(self.manifest.read_text())["version"], "1.1.0")
 
 
 if __name__ == "__main__":

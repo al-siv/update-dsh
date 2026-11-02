@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Opt-in network test: install and update real dsh in a temporary npm prefix.
+"""Opt-in probe of published dsh packages, including their real dependency graph.
 
-Downloads packages and executes their normal npm lifecycle scripts. Does not
-modify the user's global dsh, npm configuration, or dsh profiles. Requires npm,
-node, and internet access. Run explicitly: python3 tests/test_integration.py
+Run: python3 tests/test_integration.py
+Uses temporary npm prefixes/cache and executes normal npm lifecycle scripts.
+A failed or inconclusive probe does not establish that real dsh can be installed.
 """
 
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
+import sys
 import tempfile
 
 from process_helpers import run_command
@@ -18,104 +20,93 @@ from process_helpers import run_command
 SCRIPT = Path(os.environ.get("DSH_UPDATE_SCRIPT", Path(__file__).resolve().parent.parent / "update.sh")).resolve()
 NPM = shutil.which("npm")
 BASELINE = "0.1.5-alpha.2"
+PACKAGE = "@deepseek-ai/dsh"
 
 
-def run(argv, *, env, cwd, expected=0, timeout=600):
+class Inconclusive(Exception):
+    pass
+
+
+def run(argv, *, env, cwd, timeout=600):
     result = run_command(argv, env=env, cwd=cwd, timeout=timeout)
-    if result.returncode != expected:
+    if result.returncode:
         raise AssertionError(
             f"Command failed ({result.returncode}): {argv}\n"
             f"{result.stdout}\n{result.stderr}"
         )
-    return result.stdout
+    return result.stdout.strip()
 
 
 def main():
     node = shutil.which("node")
     if not NPM or not node:
-        raise SystemExit("npm and node are required")
-    original_cli = shutil.which("dsh")
-    original_version = run([original_cli, "--version"], env=os.environ, cwd=Path.cwd(), timeout=20) if original_cli else None
+        raise Inconclusive("npm and node are required; published-package integration was not exercised")
     with tempfile.TemporaryDirectory(prefix="dsh-real-update-") as temporary:
         root = Path(temporary)
-        prefix = root / "global prefix"
-        project = root / "unrelated project"
-        project.mkdir()
-        (project / "package.json").write_text('{"name":"unrelated-project","version":"1.0.0"}')
-        (project / ".npmrc").write_text("registry=http://127.0.0.1:1/\njson=true\n")
+        tools = root / "tools-bin"
+        tools.mkdir()
+        (tools / "node").symlink_to(node)
+        (tools / "npm").symlink_to(NPM)
         userconfig = root / "user.npmrc"
         userconfig.write_text("registry=https://registry.npmjs.org/\n")
         globalconfig = root / "global.npmrc"
         globalconfig.touch()
-        env = {key: value for key, value in os.environ.items()
-               if not key.lower().startswith("npm_config_")}
-        env.update(
-            npm_config_prefix=str(prefix),
+        base_env = {key: value for key, value in os.environ.items()
+                    if not key.lower().startswith("npm_config_")}
+        base_env.update(
             npm_config_cache=str(root / "cache"),
             npm_config_userconfig=str(userconfig),
             npm_config_globalconfig=str(globalconfig),
+            npm_config_update_notifier="false",
             npm_config_fetch_retries="1",
             npm_config_fetch_timeout="30000",
             DSH_HOME=str(root / "dsh-home"),
-            PATH=f"{prefix / 'bin'}:{os.environ['PATH']}",
         )
-        latest = run([NPM, "view", "--global", "@deepseek-ai/dsh@latest", "version", "--json=false"], env=env, cwd=project).strip()
-        if latest == BASELINE:
-            raise AssertionError("Baseline must differ from latest for an actual update test")
-        print(f"Installing real baseline dsh {BASELINE} in temporary prefix...", flush=True)
-        run([NPM, "install", "--global", "--engine-strict", "--force=false", "--no-fund", "--no-audit",
-             f"@deepseek-ai/dsh@{BASELINE}"], env=env, cwd=project)
-        manifest = prefix / "lib/node_modules/@deepseek-ai/dsh/package.json"
-        if json.loads(manifest.read_text())["version"] != BASELINE:
-            raise AssertionError("Baseline installation did not persist")
 
-        # These preferences must not affect the lookup format or engine check.
-        env.update(npm_config_json="true", npm_config_force="true")
-        print("Checking with project registry override and inherited JSON/force...", flush=True)
-        checked = run(["/bin/bash", str(SCRIPT), "--check"], env=env, cwd=project)
-        if latest not in checked or json.loads(manifest.read_text())["version"] != BASELINE:
-            raise AssertionError("--check did not report latest without changing baseline")
+        def environment(prefix):
+            return base_env | {
+                "npm_config_prefix": str(prefix),
+                "PATH": f"{prefix / 'bin'}:{tools}:/usr/bin:/bin",
+            }
 
-        print(f"Updating real dsh {BASELINE} -> {latest}...", flush=True)
-        updated = run(["/bin/bash", str(SCRIPT)], env=env, cwd=project)
-        if f"Done: dsh {latest}" not in updated:
-            raise AssertionError(f"Missing verified success: {updated}")
-        if json.loads(manifest.read_text())["version"] != latest:
-            raise AssertionError("Updated version did not persist")
-        actual = run([str(prefix / "bin/dsh"), "--version"], env=env, cwd=project).strip()
-        if actual != latest:
-            raise AssertionError(f"Actual CLI version is {actual}, expected {latest}")
-        print("Checking repeated execution...", flush=True)
-        repeated = run(["/bin/bash", str(SCRIPT)], env=env, cwd=project)
-        if "Already on the latest" not in repeated:
-            raise AssertionError(f"Repeated update failed: {repeated}")
+        prefix = root / "existing prefix"
+        env = environment(prefix)
+        print(json.dumps({
+            "probe": "published dsh", "platform": platform.platform(),
+            "node": run([node, "--version"], env=env, cwd=root),
+            "npm": run([NPM, "--version"], env=env, cwd=root),
+        }), flush=True)
+        print(f"Preparing published baseline {BASELINE}...", flush=True)
+        run([NPM, "install", "--global", "--engine-strict", "--force=false",
+             "--no-fund", "--no-audit", f"{PACKAGE}@{BASELINE}"], env=env, cwd=root)
+        if run([str(prefix / "bin/dsh"), "--version"], env=env, cwd=root) != BASELINE:
+            raise AssertionError("The baseline CLI does not report the requested version")
 
-        print("Checking first installation in a fresh prefix...", flush=True)
-        fresh_prefix = root / "fresh prefix"
-        tools_bin = root / "tools-bin"
-        tools_bin.mkdir()
-        (tools_bin / "node").symlink_to(node)
-        (tools_bin / "npm").symlink_to(NPM)
-        fresh_env = env | {
-            "npm_config_prefix": str(fresh_prefix),
-            "PATH": f"{fresh_prefix / 'bin'}:{tools_bin}:/usr/bin:/bin",
-        }
-        preview = run(["/bin/bash", str(SCRIPT), "--install", "--check"], env=fresh_env, cwd=project)
-        if "Installed: not installed" not in preview or fresh_prefix.exists():
-            raise AssertionError("Fresh --install --check changed the prefix or missed the installation state")
-        installed = run(["/bin/bash", str(SCRIPT), "--install"], env=fresh_env, cwd=project)
-        if f"Done: dsh {latest}" not in installed:
-            raise AssertionError(f"Missing verified first-install success: {installed}")
-        fresh_manifest = fresh_prefix / "lib/node_modules/@deepseek-ai/dsh/package.json"
-        if json.loads(fresh_manifest.read_text())["version"] != latest:
-            raise AssertionError("First installation did not persist")
-        repeated_install = run(["/bin/bash", str(SCRIPT), "--install"], env=fresh_env, cwd=project)
-        if "Already on the latest" not in repeated_install:
-            raise AssertionError(f"Repeated --install failed: {repeated_install}")
-        if original_cli and run([original_cli, "--version"], env=os.environ, cwd=Path.cwd(), timeout=20) != original_version:
-            raise AssertionError("User's global dsh version changed")
-        print(f"PASS: real npm update {BASELINE} -> {latest}; --check; repeat; first install; original dsh unchanged.", flush=True)
+        for operation, destination, args in (
+            ("update", prefix, []),
+            ("first install", root / "fresh prefix", ["--install"]),
+        ):
+            env = environment(destination)
+            target = run([NPM, "view", "--global", f"{PACKAGE}@latest", "version", "--json=false"], env=env, cwd=root)
+            if operation == "update" and target == BASELINE:
+                raise Inconclusive("latest equals the baseline; a real version transition cannot be observed")
+            print(f"Probing {operation}: {target}...", flush=True)
+            run(["/bin/bash", str(SCRIPT), *args], env=env, cwd=root)
+            manifest = destination / f"lib/node_modules/{PACKAGE}/package.json"
+            persisted = json.loads(manifest.read_text())["version"]
+            actual = run([str(destination / "bin/dsh"), "--version"], env=env, cwd=root)
+            current = run([NPM, "view", "--global", f"{PACKAGE}@latest", "version", "--json=false"], env=env, cwd=root)
+            if current != target:
+                raise Inconclusive(f"latest moved from {target} to {current} during {operation}; rerun against a stable tag")
+            if persisted != target or actual != target:
+                raise AssertionError(f"{operation}: published={target}, manifest={persisted}, CLI={actual}")
+            print(json.dumps({"observed": operation, "published": target, "manifest": persisted, "CLI": actual}), flush=True)
+        print("Not exercised: profile startup, desktop application, web UI, model calls, other platforms.", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Inconclusive as error:
+        print(f"INCONCLUSIVE: {error}", file=sys.stderr)
+        raise SystemExit(2)

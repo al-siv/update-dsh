@@ -16,15 +16,10 @@ PS = shutil.which("ps")
 
 
 class ProcessTests(unittest.TestCase):
-    def test_result_preserves_exit_status_and_both_streams(self):
-        result = run_command(
-            [sys.executable, "-c",
-             'import sys; print("output"); print("diagnostic", file=sys.stderr); sys.exit(7)'],
-            timeout=5,
-        )
-        self.assertEqual(result.returncode, 7)
-        self.assertEqual(result.stdout, "output\n")
-        self.assertEqual(result.stderr, "diagnostic\n")
+    @classmethod
+    def setUpClass(cls):
+        if not PS:
+            raise RuntimeError("INCONCLUSIVE: process-state observations require ps")
 
     @staticmethod
     def kill_group(pid):
@@ -55,12 +50,12 @@ class ProcessTests(unittest.TestCase):
                     f"{name} is still running after timeout: {state.stdout}",
                 )
 
-    @unittest.skipUnless(PS, "ps is required to inspect process state")
     def test_timeout_stops_parent_and_descendant(self):
+        """A live parent and its TERM-ignoring child both stop at the deadline."""
         self.assert_timeout_stops_group(parent_exits=False)
 
-    @unittest.skipUnless(PS, "ps is required to inspect process state")
     def test_timeout_stops_descendant_even_if_parent_has_exited(self):
+        """An exited leader still has a live child holding captured pipes open."""
         self.assert_timeout_stops_group(parent_exits=True)
 
 
