@@ -10,8 +10,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -52,6 +54,14 @@ elif args[0] == "view":
     else:
         print(version)
 elif args[0] == "install":
+    if os.environ.get("TEST_INSTALL_WAIT"):
+        import time
+        (root / "install-waiting").touch()
+        deadline = time.monotonic() + 15
+        while not (root / "install-release").exists():
+            if time.monotonic() >= deadline:
+                sys.exit("timed out waiting for installation release")
+            time.sleep(0.01)
     if os.environ.get("TEST_INSTALL_FAIL"):
         print("installation failed", file=sys.stderr)
         sys.exit(25)
@@ -111,6 +121,30 @@ class UpdateTests(unittest.TestCase):
             cwd=self.root, text=True, capture_output=True, timeout=20,
         )
 
+    def start_update(self, *args, **environment):
+        process = subprocess.Popen(
+            ["/bin/bash", str(SCRIPT), *args], env=self.env | environment,
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(self.stop_update, process)
+        return process
+
+    @staticmethod
+    def stop_update(process):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
+
+    def wait_for_install(self, process):
+        deadline = time.monotonic() + 10
+        while not (self.root / "install-waiting").exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(f"Updater exited before installation: {stdout}\n{stderr}")
+            self.assertLess(time.monotonic(), deadline, "Updater did not reach installation")
+            time.sleep(0.01)
+
     def calls(self, command):
         log = self.root / "calls.jsonl"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -168,10 +202,52 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.calls("install"), [])
 
     def test_invalid_version_prevents_installation(self):
-        for value in ("", "null", '"1.2.0"', "1.2.0\n1.3.0"):
+        for value in ("", "null", '"1.2.0"', "1.2.0\n1.3.0", "01.2.0",
+                      "1.2.0-01", "1.2.0-alpha..1", "1.2.0+build..1"):
             with self.subTest(value=value):
                 result = self.run_update(TEST_LATEST=value)
                 self.assert_failed(result, "invalid version")
+        self.assertEqual(self.calls("install"), [])
+
+    def test_invalid_installed_version_is_an_error_instead_of_a_successful_skip(self):
+        for channel in ("latest", "next"):
+            for value in ("broken", "1.1", "1.1.0.0", "01.1.0", "1.1.0-01", None):
+                with self.subTest(channel=channel, installed=value):
+                    self.manifest.write_text(json.dumps({"version": value}))
+                    result = self.run_update("--channel", channel)
+                    self.assert_failed(result, "Installed package has an invalid version")
+                    self.assertNotIn("nothing to install", result.stdout)
+        self.assertEqual(self.calls("install"), [])
+
+    def test_comparison_process_failure_is_not_treated_as_a_version_order(self):
+        node = self.bin / "node"
+        node.unlink()  # Replace the fixture symlink, never the real Node executable.
+        node.write_text(
+            '#!/usr/bin/env python3\n'
+            'import os, sys\n'
+            'args = sys.argv[1:]\n'
+            'if len(args) == 4 and args[:2] == ["--input-type=commonjs", "-"] and args[2] == "1.2.0":\n'
+            '    print("comparison process failed", file=sys.stderr)\n'
+            '    sys.exit(42)\n'
+            f'os.execv({NODE!r}, [{NODE!r}, *args])\n'
+        )
+        node.chmod(0o755)
+        for channel in ("latest", "next"):
+            with self.subTest(channel=channel):
+                self.manifest.write_text(json.dumps({"version": "1.1.0"}))
+                result = self.run_update("--channel", channel, TEST_NEXT="1.2.0")
+                self.assert_failed(result, "comparison process failed")
+                self.assertEqual(result.returncode, 42)
+                self.assertNotIn("nothing to install", result.stdout)
+        self.assertEqual(self.calls("install"), [])
+
+    def test_check_works_without_write_access_to_global_installation(self):
+        for directory in (self.prefix, self.package.parent.parent):
+            directory.chmod(0o555)
+            self.addCleanup(directory.chmod, 0o755)
+        result = self.run_update("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.version(), "1.1.0")
         self.assertEqual(self.calls("install"), [])
 
     def test_install_error_keeps_failure_status_and_allows_retry(self):
@@ -252,6 +328,7 @@ class UpdateTests(unittest.TestCase):
         # numbers and below alphanumeric ones; more identifiers rank higher;
         # build metadata does not count.
         cases = (
+            ("v1.1.0", "1.2.0", True), ("v1.2.0", "1.2.0", False),
             ("1.2.0-rc.9", "1.2.0-rc.10", True), ("1.2.0-rc.10", "1.2.0-rc.9", False),
             ("1.9.0", "1.10.0", True), ("1.10.0", "1.9.0", False),
             ("1.2.0-rc.2", "1.2.0", True), ("1.2.0", "1.2.0-rc.3", False),
@@ -266,6 +343,39 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.version(), tagged if newer else installed)
                 self.assertEqual("Done:" in result.stdout, newer, result.stdout)
+
+    def test_concurrent_next_updates_reject_overlap_and_retry_reads_current_version(self):
+        first = self.start_update("--channel", "next", TEST_NEXT="1.2.0", TEST_INSTALL_WAIT="1")
+        self.wait_for_install(first)
+        second = self.run_update("--channel", "next", TEST_NEXT="1.3.0")
+        self.assert_failed(second, "Could not acquire update lock")
+        self.assertEqual(len(self.calls("view")), 1)
+        self.assertEqual(len(self.calls("install")), 1)
+        (self.root / "install-release").touch()
+        stdout, stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(self.version(), "1.2.0")
+
+        retry = self.run_update("--channel", "next", TEST_NEXT="1.3.0")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn("Installed: 1.2.0", retry.stdout)
+        self.assertEqual(self.version(), "1.3.0")
+        older = self.run_update("--channel", "next", TEST_NEXT="1.2.0")
+        self.assertEqual(older.returncode, 0, older.stderr)
+        self.assertIn("not newer", older.stdout)
+        self.assertEqual(self.version(), "1.3.0")
+        self.assertEqual(len(self.calls("install")), 2)
+
+    def test_terminated_update_releases_lock_for_retry(self):
+        process = self.start_update(TEST_INSTALL_WAIT="1")
+        self.wait_for_install(process)
+        os.killpg(process.pid, signal.SIGTERM)
+        process.communicate(timeout=10)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(self.version(), "1.1.0")
+        retry = self.run_update()
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.version(), "1.2.0")
 
     def test_next_keeps_installation_only_after_verifying_cli(self):
         for tagged, message in (("1.1.0", "Already on the next channel version."),

@@ -15,11 +15,18 @@ an npm channel: `latest` by default, or `next` with `--channel next`, which `nex
 passes. It uses npm from `PATH` and the Unix global layout (`bin/dsh` under the prefix).
 
 1. Require Node.js, npm, the installed package manifest, and an active `dsh`.
+   Update runs acquire an exclusive directory lock in the global npm root before
+   reading versions. The lock covers lookup, installation, and verification;
+   another update run fails immediately and can be retried after the first exits.
+   `--check` does not acquire a lock or require write access to the installation.
 2. Resolve the active launcher and npm's launcher to real paths; reject a mismatch
    before querying the registry or installing anything.
 3. Read the installed manifest version and query the channel's tag in global context.
    Project `.npmrc` settings do not apply; user registry and authentication do.
-   Force plain version output with `--json=false` and validate its format.
+   Force plain version output with `--json=false`. Validate both versions as SemVer;
+   an installed manifest may have a leading `v`, which is ignored for comparison.
+   The comparator prints precedence and exits successfully for every valid order;
+   invalid versions and process failures abort instead of skipping an update.
 4. If the versions match, or the channel is `next` and its version lacks higher
    SemVer precedence than the installed one, verify `dsh --version` and skip
    installation. Otherwise, `--check` reports the available version and exits
@@ -35,6 +42,12 @@ it is upgrade-only, so a `next` tag that falls behind does not downgrade dsh.
 Installation is not atomic and the script does not roll back npm changes. A retry
 rechecks the on-disk installation; broken installations may need repair through npm.
 Running dsh sessions must be restarted.
+
+The lock is the empty `.dsh-update.lock` directory under `npm root --global`.
+It is released on normal exit, errors, and handled HUP/INT/TERM signals. After an
+uncatchable termination, it may remain: confirm that no updater or npm install is
+still running for this prefix before removing the empty directory reported in the
+error. The lock coordinates these scripts; direct npm commands do not use it.
 
 The script does not launch profiles or contact a model. Normal npm lifecycle
 scripts can run during installation.
@@ -54,7 +67,9 @@ The behavior suite runs the real Bash scripts with a controlled npm subprocess
 in a temporary directory. It covers configuration, channel selection, installation
 selection including SemVer precedence on `next`, `--check`, repeated runs, failure
 before and after file changes, final version verification, retries, and `next.sh`
-beside a downloaded `update.sh`. This tests the scripts' logic, not npm's internals.
+beside a downloaded `update.sh`. Regression cases cover invalid installed versions,
+comparator process failure, read-only checks, overlapping updates, and lock release
+after termination. This tests the scripts' logic, not npm's internals.
 
 ## Real npm integration
 

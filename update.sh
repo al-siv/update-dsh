@@ -22,12 +22,17 @@ fail() {
   exit 1
 }
 
-# Succeed if version $1 has higher SemVer precedence than version $2.
-newer() {
+# Print SemVer precedence (-1, 0, 1); reserve failure status for errors.
+compare_versions() {
   node --input-type=commonjs - "$1" "$2" <<'NODE'
-const parse = (version) => {
-  const [release, ...rest] = version.split('+')[0].split('-');
-  return [release.split('.').map(BigInt), rest.length ? rest.join('-').split('.') : []];
+const parse = (version, source, allowV = false) => {
+  const value = allowV ? version.replace(/^v/, '') : version;
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
+  const prerelease = match && match[4] ? match[4].split('.') : [];
+  if (!match || prerelease.some((id) => /^0[0-9]+$/.test(id))) {
+    throw new Error(`${source}: ${version}`);
+  }
+  return [match.slice(1, 4).map(BigInt), prerelease];
 };
 const order = (a, b) => (a > b) - (a < b);
 const numeric = (identifier) => /^[0-9]+$/.test(identifier);
@@ -47,7 +52,15 @@ const compare = ([releaseA, preA], [releaseB, preB]) => {
   }
   return order(preA.length, preB.length);
 };
-process.exit(compare(parse(process.argv[2]), parse(process.argv[3])) > 0 ? 0 : 1);
+try {
+  const available = parse(process.argv[2], 'npm returned an invalid version');
+  // npm can preserve a leading v in an installed tarball's manifest.
+  const installed = parse(process.argv[3], 'Installed package has an invalid version', true);
+  console.log(compare(available, installed));
+} catch (error) {
+  console.error(`Error: ${error.message}`);
+  process.exit(1);
+}
 NODE
 }
 
@@ -78,6 +91,18 @@ launcher="$prefix/bin/dsh"
 [[ -f "$manifest" ]] || fail "Global installation of $package was not found in $package_root."
 active_launcher=$(command -v dsh) || fail 'dsh was not found in PATH.'
 
+# Serialize updates before reading versions, including registry lookup and final
+# verification. A read-only check does not require write access to this directory.
+if ! "$check_only"; then
+  lock_dir="$package_root/.dsh-update.lock"
+  mkdir -- "$lock_dir" ||
+    fail "Could not acquire update lock at $lock_dir. Another dsh update may be running; retry when it finishes."
+  trap 'rmdir -- "$lock_dir"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
+
 # Refuse to update a different installation from the one the shell uses.
 node --input-type=commonjs - "$active_launcher" "$launcher" <<'NODE' || exit 1
 const fs = require('node:fs');
@@ -96,8 +121,8 @@ printf 'Installed: %s\nChecking npm %s...\n' "$installed" "$channel"
 # Use the same npm configuration scope as the global installation, and keep
 # user/project JSON preferences from changing the version's representation.
 available=$(npm view --global "$package@$channel" version --json=false --fetch-retries=1 --fetch-timeout=15000)
-[[ "$available" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
-  fail "npm returned an invalid version: $available"
+# Keep this assignment outside a condition so a comparator failure aborts.
+precedence=$(compare_versions "$available" "$installed")
 printf 'Available: %s\n' "$available"
 
 # On next, a version without higher precedence is kept, so a next tag that
@@ -105,7 +130,7 @@ printf 'Available: %s\n' "$available"
 keep=
 if [[ "$installed" == "$available" ]]; then
   keep="Already on the $channel channel version."
-elif [[ "$channel" == next ]] && ! newer "$available" "$installed"; then
+elif [[ "$channel" == next && "$precedence" -le 0 ]]; then
   keep='The next channel version is not newer than the installed one; nothing to install.'
 fi
 if [[ -n "$keep" ]]; then

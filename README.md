@@ -71,6 +71,7 @@ script is for global npm installs. For source checkouts, follow the
 | dsh in `PATH` differs from the current npm installation | Run `command -v dsh`, `command -v npm`, and `npm prefix --global`. Activate the Node environment that owns your dsh installation. |
 | npm reports `EBADENGINE` | Check `npm view --global @deepseek-ai/dsh@latest engines` (`@next` for `next.sh`) and use a compatible Node.js version. The script enforces engine requirements. |
 | npm cannot reach the registry | Check your network and `npm config get registry`. The script respects your user-level npm registry and authentication. |
+| The update lock cannot be acquired | Wait for the other updater to finish and retry. If it was forcibly terminated, confirm no updater or npm install is still running for that prefix, then remove the empty lock directory shown in the error. |
 | An update fails | Read the npm or CLI error. npm may already have changed files; there is no automatic rollback. Repair a broken installation through npm before retrying. |
 
 ## How it works
@@ -78,6 +79,9 @@ script is for global npm installs. For source checkouts, follow the
 The script ignores unrelated project `.npmrc` settings, pins the resolved version,
 rejects incompatible Node.js engines even with inherited npm `force=true`, and
 returns a nonzero exit code if installation or CLI verification fails.
+Update runs use an exclusive lock to prevent overlapping installations; `--check`
+does not require write access to the global installation. Invalid versions and
+comparison errors are reported as failures.
 
 [MIT license](LICENSE) · [Implementation and tests](docs/development.md) ·
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) ·
