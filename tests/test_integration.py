@@ -10,8 +10,9 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import tempfile
+
+from process_helpers import run_command
 
 
 SCRIPT = Path(os.environ.get("DSH_UPDATE_SCRIPT", Path(__file__).resolve().parent.parent / "update.sh")).resolve()
@@ -19,9 +20,8 @@ NPM = shutil.which("npm")
 BASELINE = "0.1.5-alpha.2"
 
 
-def run(argv, *, env, cwd, expected=0):
-    result = subprocess.run(argv, env=env, cwd=cwd, text=True,
-                            capture_output=True, timeout=600)
+def run(argv, *, env, cwd, expected=0, timeout=600):
+    result = run_command(argv, env=env, cwd=cwd, timeout=timeout)
     if result.returncode != expected:
         raise AssertionError(
             f"Command failed ({result.returncode}): {argv}\n"
@@ -31,10 +31,11 @@ def run(argv, *, env, cwd, expected=0):
 
 
 def main():
-    if not NPM:
-        raise SystemExit("npm is required")
+    node = shutil.which("node")
+    if not NPM or not node:
+        raise SystemExit("npm and node are required")
     original_cli = shutil.which("dsh")
-    original_version = subprocess.check_output([original_cli, "--version"], text=True) if original_cli else None
+    original_version = run([original_cli, "--version"], env=os.environ, cwd=Path.cwd(), timeout=20) if original_cli else None
     with tempfile.TemporaryDirectory(prefix="dsh-real-update-") as temporary:
         root = Path(temporary)
         prefix = root / "global prefix"
@@ -88,9 +89,32 @@ def main():
         repeated = run(["/bin/bash", str(SCRIPT)], env=env, cwd=project)
         if "Already on the latest" not in repeated:
             raise AssertionError(f"Repeated update failed: {repeated}")
-        if original_cli and subprocess.check_output([original_cli, "--version"], text=True) != original_version:
+
+        print("Checking first installation in a fresh prefix...", flush=True)
+        fresh_prefix = root / "fresh prefix"
+        tools_bin = root / "tools-bin"
+        tools_bin.mkdir()
+        (tools_bin / "node").symlink_to(node)
+        (tools_bin / "npm").symlink_to(NPM)
+        fresh_env = env | {
+            "npm_config_prefix": str(fresh_prefix),
+            "PATH": f"{fresh_prefix / 'bin'}:{tools_bin}:/usr/bin:/bin",
+        }
+        preview = run(["/bin/bash", str(SCRIPT), "--install", "--check"], env=fresh_env, cwd=project)
+        if "Installed: not installed" not in preview or fresh_prefix.exists():
+            raise AssertionError("Fresh --install --check changed the prefix or missed the installation state")
+        installed = run(["/bin/bash", str(SCRIPT), "--install"], env=fresh_env, cwd=project)
+        if f"Done: dsh {latest}" not in installed:
+            raise AssertionError(f"Missing verified first-install success: {installed}")
+        fresh_manifest = fresh_prefix / "lib/node_modules/@deepseek-ai/dsh/package.json"
+        if json.loads(fresh_manifest.read_text())["version"] != latest:
+            raise AssertionError("First installation did not persist")
+        repeated_install = run(["/bin/bash", str(SCRIPT), "--install"], env=fresh_env, cwd=project)
+        if "Already on the latest" not in repeated_install:
+            raise AssertionError(f"Repeated --install failed: {repeated_install}")
+        if original_cli and run([original_cli, "--version"], env=os.environ, cwd=Path.cwd(), timeout=20) != original_version:
             raise AssertionError("User's global dsh version changed")
-        print(f"PASS: real npm update {BASELINE} -> {latest}; --check; repeat; original dsh unchanged.", flush=True)
+        print(f"PASS: real npm update {BASELINE} -> {latest}; --check; repeat; first install; original dsh unchanged.", flush=True)
 
 
 if __name__ == "__main__":

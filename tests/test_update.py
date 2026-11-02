@@ -16,6 +16,8 @@ import tempfile
 import time
 import unittest
 
+from process_helpers import run_command, stop_process_group
+
 
 SCRIPT = Path(os.environ.get("DSH_UPDATE_SCRIPT", Path(__file__).resolve().parent.parent / "update.sh")).resolve()
 NEXT_SCRIPT = Path(__file__).resolve().parent.parent / "next.sh"
@@ -28,6 +30,7 @@ NPM_FIXTURE = r'''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 args = sys.argv[1:]
@@ -71,7 +74,16 @@ elif args[0] == "install":
             print("EBADENGINE", file=sys.stderr)
             sys.exit(26)
     if not os.environ.get("TEST_SKIP_WRITE"):
+        manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(json.dumps({"version": args[-1].split("@")[-1]}))
+        launcher = manifest.parent / "bin.js"
+        if not launcher.exists():
+            shutil.copyfile(root / "cli-fixture.js", launcher)
+            launcher.chmod(0o755)
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        link = prefix / "bin/dsh"
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(launcher)
     if os.environ.get("TEST_PARTIAL_INSTALL_FAIL"):
         (manifest.parent / "bin.js").unlink()
         print("partial installation failed", file=sys.stderr)
@@ -100,10 +112,14 @@ class UpdateTests(unittest.TestCase):
         launcher = self.package / "bin.js"
         launcher.write_text(
             '#!/usr/bin/env node\n'
-            'if (process.env.TEST_CLI_FAIL) process.exit(27);\n'
+            'if (process.env.TEST_CLI_FAIL) {\n'
+            '  if (process.env.TEST_CLI_FAILURE_OUTPUT) console.log(process.env.TEST_CLI_FAILURE_OUTPUT);\n'
+            '  process.exit(27);\n'
+            '}\n'
             'console.log(process.env.TEST_CLI_VERSION || require("./package.json").version);\n'
         )
         launcher.chmod(0o755)
+        shutil.copyfile(launcher, self.root / "cli-fixture.js")
         (self.bin / "dsh").symlink_to(launcher)
         npm = self.bin / "npm"
         npm.write_text(NPM_FIXTURE)
@@ -116,9 +132,9 @@ class UpdateTests(unittest.TestCase):
         self.env.update(PATH=f"{self.bin}:/usr/bin:/bin", TEST_ROOT=str(self.root))
 
     def run_update(self, *args, script=SCRIPT, **environment):
-        return subprocess.run(
+        return run_command(
             ["/bin/bash", str(script), *args], env=self.env | environment,
-            cwd=self.root, text=True, capture_output=True, timeout=20,
+            cwd=self.root, timeout=20,
         )
 
     def start_update(self, *args, **environment):
@@ -127,14 +143,8 @@ class UpdateTests(unittest.TestCase):
             cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        self.addCleanup(self.stop_update, process)
+        self.addCleanup(stop_process_group, process)
         return process
-
-    @staticmethod
-    def stop_update(process):
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate(timeout=5)
 
     def wait_for_install(self, process):
         deadline = time.monotonic() + 10
@@ -152,6 +162,10 @@ class UpdateTests(unittest.TestCase):
 
     def version(self):
         return json.loads(self.manifest.read_text())["version"]
+
+    def remove_installation(self):
+        (self.bin / "dsh").unlink()
+        shutil.rmtree(self.prefix / "lib")
 
     def assert_failed(self, result, message):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -287,10 +301,41 @@ class UpdateTests(unittest.TestCase):
 
     def test_cli_failure_after_install_is_not_success(self):
         result = self.run_update(TEST_CLI_FAIL="1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("Done:", result.stdout)
+        self.assert_failed(result, "dsh --version failed (exit 27)")
+        self.assertEqual(result.returncode, 27)
         # The install has taken effect; no rollback is promised by the script.
         self.assertEqual(self.version(), "1.2.0")
+
+    def test_cli_failure_when_current_reports_error_and_preserves_status(self):
+        result = self.run_update(TEST_LATEST="1.1.0", TEST_CLI_FAIL="1")
+        self.assert_failed(result, "dsh --version failed (exit 27)")
+        self.assertEqual(result.returncode, 27)
+        self.assertNotIn("Already on the latest", result.stdout)
+        self.assertEqual(self.calls("install"), [])
+
+    def test_cli_failure_forwards_captured_stdout_to_stderr(self):
+        result = self.run_update(TEST_CLI_FAIL="1", TEST_CLI_FAILURE_OUTPUT="Cannot load runtime")
+        self.assert_failed(result, "dsh --version failed (exit 27)")
+        self.assertEqual(result.returncode, 27)
+        self.assertIn("Cannot load runtime", result.stderr)
+        self.assertNotIn("Cannot load runtime", result.stdout)
+
+    def test_missing_launcher_reports_incomplete_installation_instead_of_path(self):
+        (self.bin / "dsh").unlink()
+        result = self.run_update("--install")
+        self.assert_failed(result, "Global dsh installation is incomplete")
+        self.assertIn("Repair @deepseek-ai/dsh with npm", result.stderr)
+        self.assertNotIn("Add", result.stderr)
+        self.assertEqual(self.calls("view"), [])
+        self.assertEqual(self.calls("install"), [])
+
+    def test_non_executable_launcher_reports_incomplete_installation(self):
+        (self.package / "bin.js").chmod(0o644)
+        result = self.run_update()
+        self.assert_failed(result, "Global dsh installation is incomplete")
+        self.assertNotIn("Add", result.stderr)
+        self.assertEqual(self.calls("view"), [])
+        self.assertEqual(self.calls("install"), [])
 
     def test_wrong_cli_version_when_current_is_not_success(self):
         result = self.run_update(TEST_LATEST="1.1.0", TEST_CLI_VERSION="0.0.1")
@@ -312,7 +357,106 @@ class UpdateTests(unittest.TestCase):
         self.manifest.unlink()
         result = self.run_update()
         self.assert_failed(result, "was not found")
+        self.assertIn("--install", result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.calls("view"), [])
         self.assertEqual(self.calls("install"), [])
+
+    def test_install_creates_missing_global_package_and_is_idempotent(self):
+        self.remove_installation()
+        result = self.run_update("--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed: not installed", result.stdout)
+        self.assertIn("Done: dsh 1.2.0", result.stdout)
+        self.assertEqual(self.version(), "1.2.0")
+        retry = self.run_update("--install")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn("Already on the latest", retry.stdout)
+        self.assertEqual(len(self.calls("install")), 1)
+
+    def test_install_flag_updates_an_existing_installation(self):
+        result = self.run_update("--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed: 1.1.0", result.stdout)
+        self.assertEqual(self.version(), "1.2.0")
+
+    def test_install_check_does_not_create_missing_global_root(self):
+        self.remove_installation()
+        result = self.run_update("--install", "--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed: not installed", result.stdout)
+        self.assertIn("Available: 1.2.0", result.stdout)
+        self.assertFalse((self.prefix / "lib").exists())
+        self.assertEqual(self.calls("install"), [])
+
+    def test_next_wrapper_can_install_without_an_installed_version(self):
+        self.remove_installation()
+        download = self.root / "download"
+        download.mkdir()
+        shutil.copyfile(SCRIPT, download / "update.sh")
+        shutil.copyfile(NEXT_SCRIPT, download / "next.sh")
+        result = self.run_update("--install", script=download / "next.sh", TEST_NEXT="0.0.0-0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.version(), "0.0.0-0")
+        self.assertIn("@deepseek-ai/dsh@next", self.calls("view")[0])
+
+    def test_install_refuses_to_shadow_a_foreign_dsh(self):
+        self.remove_installation()
+        foreign = self.bin / "dsh"
+        content = "#!/bin/sh\nexit 0\n"
+        foreign.write_text(content)
+        foreign.chmod(0o755)
+        result = self.run_update("--install")
+        self.assert_failed(result, "dsh in PATH")
+        self.assertEqual(foreign.read_text(), content)
+        self.assertEqual(self.calls("view"), [])
+        self.assertEqual(self.calls("install"), [])
+
+    def test_install_reports_npm_failure_and_preserves_its_exit_code(self):
+        self.remove_installation()
+        result = self.run_update("--install", TEST_INSTALL_FAIL="1")
+        self.assert_failed(result, "npm installation failed (exit 25)")
+        self.assertEqual(result.returncode, 25)
+        self.assertFalse(self.manifest.exists())
+        retry = self.run_update("--install")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.version(), "1.2.0")
+
+    def test_install_does_not_claim_success_if_npm_created_no_launcher(self):
+        self.remove_installation()
+        result = self.run_update("--install", TEST_SKIP_WRITE="1")
+        self.assert_failed(result, "npm did not create an executable dsh launcher")
+        self.assertEqual(result.returncode, 1)
+
+    def test_install_reports_missing_path_even_if_package_was_written(self):
+        self.remove_installation()
+        tools_bin = self.root / "tools-bin"
+        tools_bin.mkdir()
+        for name in ("npm", "node", "python3"):
+            (tools_bin / name).symlink_to(self.bin / name)
+        result = self.run_update("--install", PATH=f"{tools_bin}:/usr/bin:/bin")
+        self.assert_failed(result, f"Add {self.bin} to PATH")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.version(), "1.2.0")
+
+    def test_install_validates_registry_version_before_installing(self):
+        self.remove_installation()
+        result = self.run_update("--install", TEST_LATEST="1.2.0-alpha..1")
+        self.assert_failed(result, "npm returned an invalid version")
+        self.assertEqual(self.calls("install"), [])
+
+    def test_concurrent_first_installations_use_the_same_lock(self):
+        self.remove_installation()
+        first = self.start_update("--install", TEST_INSTALL_WAIT="1")
+        self.wait_for_install(first)
+        second = self.run_update("--install")
+        self.assert_failed(second, "Could not acquire update lock")
+        self.assertEqual(len(self.calls("view")), 1)
+        self.assertEqual(len(self.calls("install")), 1)
+        (self.root / "install-release").touch()
+        stdout, stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(self.version(), "1.2.0")
 
     def test_channel_selects_npm_tag(self):
         for channel, version in (("latest", "1.2.0"), ("next", "1.3.0-rc.1")):
