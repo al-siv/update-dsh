@@ -88,9 +88,9 @@ be reported separately from successful observations.
 ## Local probes
 
 ```sh
-python3 tests/test_update.py
-python3 tests/test_npm.py
-python3 tests/test_process.py
+python3 -B tests/test_update.py
+python3 -B tests/test_npm.py
+python3 -B tests/test_process.py
 ```
 
 ### Controlled counterexamples: test_update.py
@@ -151,7 +151,7 @@ members; descendants that deliberately create another session are not exercised.
 ## Published-package integration: test_integration.py
 
 ```sh
-python3 tests/test_integration.py
+python3 -B tests/test_integration.py
 ```
 
 This opt-in network probe adds the observation unavailable from the small local

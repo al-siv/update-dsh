@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in probe of published dsh packages, including their real dependency graph.
 
-Run: python3 tests/test_integration.py
+Run: python3 -B tests/test_integration.py
 Uses temporary npm prefixes/cache and executes normal npm lifecycle scripts.
 A failed or inconclusive probe does not establish that real dsh can be installed.
 """

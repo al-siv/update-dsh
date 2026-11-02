@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Counterexamples using controlled subprocess faults and real filesystem state.
 
-Run: python3 tests/test_update.py
+Run: python3 -B tests/test_update.py
 Set DSH_UPDATE_SCRIPT to test an isolated copy (used for mutation checks).
 This fixture does not model npm configuration, engine checks, or installability.
 Those observations require test_npm.py or the published-package probe.

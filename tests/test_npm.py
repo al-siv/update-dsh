@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real npm integration with tiny packages served by a temporary local registry.
 
-Run: python3 tests/test_npm.py
+Run: python3 -B tests/test_npm.py
 No external registry, user npm configuration, or global installation is used.
 """
 
